@@ -15,6 +15,8 @@ func init() {
 	DefaultContainer = NewContainer()
 }
 
+// TODO: find a proper place for funcs below
+
 func Service[T any]() func(Container) T {
 	return func(c Container) T {
 		return MustGet[T](c)
