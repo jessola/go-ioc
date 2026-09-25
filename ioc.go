@@ -1,89 +1,82 @@
-// Package ioc provides a lightweight dependency injection container, with request scoping.
+// Package ioc provides a reflection based dependency injection container with
+// Transient, Singleton and Scoped dependency lifetimes.
 package ioc
 
-import "reflect"
-
-var (
-	DefaultCollection Collection
+import (
+	"fmt"
+	"reflect"
 )
 
+var DefaultContainer Container
+
+type Func func(Container) []reflect.Value
+
 func init() {
-	DefaultCollection = NewCollection()
+	DefaultContainer = NewContainer()
 }
 
-type Key any
-type Service any
+// TODO: find a proper place for funcs below
 
-type Collection interface {
-	Get(Key) (Service, error)
-	MustGet(Key) Service
-	AddSingleton(k Key, fn any) error
-	AddScoped(k Key, fn any) error
-	AddTransient(k Key, fn any) error
-	NewScope() Scope
-	Destroy() error
-}
-
-type Scope interface {
-	Get(Key) (Service, error)
-	MustGet(Key) Service
-	AddScoped(k Key, fn any) error
-	AddTransient(k Key, fn any) error
-	NewScope() Scope
-	Destroy() error
-}
-
-func NewCollection() Collection {
-	col := &collection{
-		cache:     map[Key]Service{},
-		resolvers: map[Key]resolverFunc{},
+func Service[T any]() func(Container) T {
+	return func(c Container) T {
+		return MustGet[T](c)
 	}
-	col.AddScoped(reflect.TypeFor[Collection](), func() Collection { return col })
-	return col
 }
 
-// C() returns the `DefaultCollection`
-func C() Collection {
-	return DefaultCollection
-}
-
-func AddSingleton[T Key](c Collection, fn any) error {
-	return c.AddSingleton(reflect.TypeFor[T](), fn)
-}
-
-func AddScoped[T Key](s Scope, fn any) error {
-	return s.AddScoped(reflect.TypeFor[T](), fn)
-}
-
-func AddTransient[T Key](s Scope, fn any) error {
-	return s.AddTransient(reflect.TypeFor[T](), fn)
-}
-
-func Get[T Key](s Scope) (T, error) {
-	svc, err := s.Get(reflect.TypeFor[T]())
-	if err != nil {
-		return (svc).(T), err
+func ServiceNamed[T any](name string) func(Container) T {
+	return func(c Container) T {
+		return MustGetNamed[T](c, name)
 	}
-	return svc.(T), nil
 }
 
-func MustGet[T Key](s Scope) T {
-	return s.MustGet(reflect.TypeFor[T]()).(T)
-}
-
-func NewScope() Scope {
-	return DefaultCollection.NewScope()
-}
-
-func MakeFunc(s Scope, fn any) func() []reflect.Value {
-	return func() []reflect.Value {
+func MakeFunc(fn any) (Func, error) {
+	if err := ensureFunc(fn); err != nil {
+		return nil, err
+	}
+	return func(c Container) []reflect.Value {
 		var deps []reflect.Value
 		t := reflect.TypeOf(fn)
 
 		for i := 0; i < t.NumIn(); i++ {
-			deps = append(deps, reflect.ValueOf(s.MustGet(t.In(i))))
+			svc, err := c.Get(Key{Type: t.In(i)})
+			if err != nil {
+				panic(err)
+			}
+			deps = append(deps, reflect.ValueOf(svc))
 		}
 
 		return reflect.ValueOf(fn).Call(deps)
+	}, nil
+}
+
+func MakeFuncFromKeys(fn any, keys []Key) (Func, error) {
+	t := reflect.TypeOf(fn)
+
+	if err := ensureFunc(fn); err != nil {
+		return nil, err
 	}
+	if err := checkArgLength(t, keys); err != nil {
+		return nil, err
+	}
+
+	return func(c Container) []reflect.Value {
+		var deps []reflect.Value
+
+		for _, key := range keys {
+			svc, err := c.Get(key)
+			if err != nil {
+				panic(err)
+			}
+			deps = append(deps, reflect.ValueOf(svc))
+		}
+
+		return reflect.ValueOf(fn).Call(deps)
+	}, nil
+}
+
+func checkArgLength(fnType reflect.Type, keys []Key) error {
+	if len(keys) != fnType.NumIn() {
+		return fmt.Errorf("number of keys does not match number of function args")
+	}
+	return nil
 }

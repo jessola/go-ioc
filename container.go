@@ -1,150 +1,131 @@
 package ioc
 
-import (
-	"fmt"
-	"reflect"
-)
+import "fmt"
 
-type resolverFunc func(*collection) Service
-
-type collection struct {
-	parent    *collection
-	cache     map[Key]Service
-	resolvers map[Key]resolverFunc
+type AddOptions struct {
+	Key      Key
+	Scope    Scope
+	Resolver Resolver
 }
 
-type ErrDuplicateKey struct {
-	key Key
+type Container interface {
+	Add(opts AddOptions) error
+	Remove(k Key) error
+	Get(k Key) (any, error)
+	Destroy() error
+	NewScope() Container
 }
 
-func createResolverFunc(fn any) resolverFunc {
-	// var params []reflect.Type
-	// t := reflect.TypeOf(fn)
-
-	// // fmt.Println("VAL------", reflect.ValueOf(fn))
-
-	// for i := 0; i < t.NumIn(); i++ {
-	// 	params = append(params, t.In(i))
-	// }
-
-	return func(c *collection) Service {
-		return MakeFunc(c, fn)()[0].Interface()
-		// var deps []reflect.Value
-
-		// // Resolve each dependency in turn
-		// for _, p := range params {
-		// 	svc := c.MustGet(Key(p))
-		// 	deps = append(deps, reflect.ValueOf(svc))
-		// }
-
-		// output := reflect.ValueOf(fn).Call(deps)
-
-		// return output[0].Interface()
-	}
+type container struct {
+	parent    *container
+	services  map[Key]any
+	resolvers map[Key]func(*container) any
 }
 
-func (e ErrDuplicateKey) Error() string {
-	return fmt.Sprintf("duplicate key:%s", e.key)
+func NewContainer() Container {
+	return newContainer()
 }
 
-func (c *collection) AddSingleton(k Key, fn any) error {
-	// TODO: Check fn is a function
-	if _, exists := c.resolvers[k]; exists {
-		return ErrDuplicateKey{k}
+func newContainer() *container {
+	c := &container{
+		parent:    nil,
+		services:  map[Key]any{},
+		resolvers: make(map[Key]func(*container) any),
 	}
 
-	resolve := createResolverFunc(fn)
+	c.Add(AddOptions{
+		Key:   UnnamedKey[Container](),
+		Scope: Singleton,
+		Resolver: func(c Container) any {
+			return c
+		},
+	})
 
-	c.resolvers[k] = func(child *collection) Service {
-		if c.cache[k] == nil {
-			c.cache[k] = resolve(child)
+	return c
+}
+
+func newContainerWithParent(p *container) *container {
+	c := newContainer()
+	c.parent = p
+	return c
+}
+
+func (c *container) Add(opts AddOptions) error {
+	if _, exists := c.resolvers[opts.Key]; exists {
+		return fmt.Errorf("duplicate key %s", opts.Key)
+	}
+
+	k := opts.Key
+
+	switch opts.Scope {
+	case Singleton:
+		c.resolvers[k] = func(child *container) any {
+			if _, ok := c.services[k]; !ok {
+				c.services[k] = opts.Resolver(child)
+			}
+			return c.services[k]
 		}
-		return c.cache[k]
-	}
 
-	return nil
-}
-
-func (c *collection) AddScoped(k Key, fn any) error {
-	// TODO: Check fn is a function
-	if _, exists := c.resolvers[k]; exists {
-		return ErrDuplicateKey{k}
-	}
-
-	resolve := createResolverFunc(fn)
-
-	c.resolvers[k] = func(child *collection) Service {
-		if child.cache[k] == nil {
-			child.cache[k] = resolve(child)
+	case Scoped:
+		c.resolvers[k] = func(child *container) any {
+			if _, ok := child.services[k]; !ok {
+				child.services[k] = opts.Resolver(child)
+			}
+			return child.services[k]
 		}
-		return child.cache[k]
+
+	case Transient:
+		c.resolvers[k] = func(child *container) any {
+			return opts.Resolver(child)
+		}
 	}
 
 	return nil
 }
 
-func (c *collection) AddTransient(k Key, fn any) error {
-	// TODO: Check fn is a function
-	if _, exists := c.resolvers[k]; exists {
-		return ErrDuplicateKey{k}
-	}
-
-	resolve := createResolverFunc(fn)
-
-	c.resolvers[k] = func(child *collection) Service {
-		return resolve(child)
-	}
-
-	return nil
-}
-
-func (c *collection) Get(k Key) (Service, error) {
-	// Check cache
-	if svc, ok := c.cache[k]; ok {
+func (c *container) Get(k Key) (any, error) {
+	// Try local cache
+	if svc, ok := c.services[k]; ok {
 		return svc, nil
 	}
-
-	// Check local resolvers
-	if rsv, ok := c.resolvers[k]; ok {
-		return rsv(c), nil
+	// Try local resolver
+	if r, ok := c.resolvers[k]; ok {
+		return r(c), nil
 	}
-
-	// Check parent resolvers
-	if c.parent == nil {
-		return nil, fmt.Errorf("no service with key:%s", k)
-
+	// Try parent resolver
+	if c.parent != nil {
+		if r, ok := c.parent.resolvers[k]; ok {
+			c.resolvers[k] = c.parent.resolvers[k]
+			return r(c), nil
+		}
 	}
-
-	if rsv, ok := c.parent.resolvers[k]; ok {
-		c.resolvers[k] = rsv
-		return rsv(c), nil
-	}
-
-	return nil, fmt.Errorf("no service with key:%s", k)
+	return nil, fmt.Errorf("no service with key %s", k)
 }
 
-func (c *collection) MustGet(k Key) Service {
-	svc, err := c.Get(k)
-	if err != nil {
-		panic(err)
-	}
-	return svc
+func (c *container) Remove(k Key) error {
+	delete(c.services, k)
+	delete(c.resolvers, k)
+	return nil
 }
 
-func (c *collection) NewScope() Scope {
-	coll := &collection{
-		parent:    c,
-		cache:     map[Key]Service{},
-		resolvers: map[Key]resolverFunc{},
-	}
-
-	coll.AddScoped(reflect.TypeFor[Collection](), func() Collection { return coll })
-
-	return coll
-}
-
-func (c *collection) Destroy() error {
-	clear(c.cache)
+func (c *container) Destroy() error {
+	clear(c.services)
 	clear(c.resolvers)
 	return nil
+}
+
+func (c *container) NewScope() Container {
+	return newContainerWithParent(c)
+}
+
+func _(c Container) {
+	c.Add(AddOptions{
+		Key:   UnnamedKey[string](),
+		Scope: Singleton,
+		Resolver: func(c Container) any {
+			c.Get(UnnamedKey[string]())
+			c.Get(NamedKey[int]("foo"))
+			return "hello"
+		},
+	})
 }
